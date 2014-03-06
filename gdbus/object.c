@@ -86,7 +86,7 @@ struct property_data {
 
 static int global_flags = 0;
 static struct generic_data *root;
-static GSList *pending = NULL;
+static GSList *pending_data = NULL;
 
 static gboolean process_changes(gpointer user_data);
 static void process_properties_from_interface(struct generic_data *data,
@@ -639,7 +639,7 @@ static void add_pending(struct generic_data *data)
 
 	data->process_id = g_idle_add(process_changes, data);
 
-	pending = g_slist_append(pending, data);
+	pending_data = g_slist_append(pending_data, data);
 }
 
 static gboolean remove_interface(struct generic_data *data, const char *name)
@@ -987,7 +987,7 @@ static void remove_pending(struct generic_data *data)
 		data->process_id = 0;
 	}
 
-	pending = g_slist_remove(pending, data);
+	pending_data = g_slist_remove(pending_data, data);
 }
 
 static gboolean process_changes(gpointer user_data)
@@ -1468,7 +1468,7 @@ static void g_dbus_flush(DBusConnection *connection)
 {
 	GSList *l;
 
-	for (l = pending; l;) {
+	for (l = pending_data; l;) {
 		struct generic_data *data = l->data;
 
 		l = l->next;
