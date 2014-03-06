@@ -1,0 +1,1014 @@
+From 83ab1b258843405997bd6e2bafb4f7284193d8d4 Mon Sep 17 00:00:00 2001
+From: Daniel Wagner <daniel.wagner@bmw-carit.de>
+Date: Thu, 6 Mar 2014 17:25:53 +0100
+Subject: [PATCH 7/7] session_policy_pold: Add session plugin for remote
+ configuration
+
+The configuration/provisioning will be retrieved from pold, that is
+via D-Bus.
+---
+ Makefile.plugins              |  13 +
+ configure.ac                  |   6 +
+ plugins/session_policy_pold.c | 949 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 968 insertions(+)
+ create mode 100644 plugins/session_policy_pold.c
+
+diff --git a/Makefile.plugins b/Makefile.plugins
+index cf0f9a8..f517ba0 100644
+--- a/Makefile.plugins
++++ b/Makefile.plugins
+@@ -246,6 +246,19 @@ plugins_session_policy_local_la_LDFLAGS = $(plugin_ldflags)
+ endif
+ endif
+ 
++if SESSION_POLICY_POLD
++if SESSION_POLICY_POLD_BUILTIN
++builtin_modules += session_policy_pold
++builtin_sources += plugins/session_policy_pold.c
++else
++plugin_LTLIBRARIES += plugins/session_policy_pold.la
++plugin_objects += $(plugins_session_policy_pold_la_OBJECTS)
++plugins_session_policy_pold_la_CFLAGS = $(plugin_cflags) \
++				-DSTORAGEDIR=\""$(storagedir)\""
++plugins_session_policy_pold_la_LDFLAGS = $(plugin_ldflags)
++endif
++endif
++
+ if NEARD
+ builtin_modules += neard
+ builtin_sources += plugins/neard.c
+diff --git a/configure.ac b/configure.ac
+index ceb956c..5090d5c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -194,6 +194,12 @@ AC_ARG_ENABLE(session-policy-local,
+ AM_CONDITIONAL(SESSION_POLICY_LOCAL, test "${enable_session_policy_local}" != "no")
+ AM_CONDITIONAL(SESSION_POLICY_LOCAL_BUILTIN, test "${enable_session_policy_local}" = "builtin")
+ 
++AC_ARG_ENABLE(session-policy-pold,
++	AC_HELP_STRING([--enable-session-policy-pold], [enable pold file Session policy configuration support]),
++			[enable_session_policy_pold=${enableval}], [enable_session_policy_pold="no"])
++AM_CONDITIONAL(SESSION_POLICY_POLD, test "${enable_session_policy_pold}" != "no")
++AM_CONDITIONAL(SESSION_POLICY_POLD_BUILTIN, test "${enable_session_policy_pold}" = "builtin")
++
+ AC_ARG_WITH(stats-max-file-size, AC_HELP_STRING([--with-stats-max-file-size=SIZE],
+ 			[Maximal size of a statistics round robin file]),
+ 			[stats_max_file_size=${withval}])
+diff --git a/plugins/session_policy_pold.c b/plugins/session_policy_pold.c
+new file mode 100644
+index 0000000..fd54cc4
+--- /dev/null
++++ b/plugins/session_policy_pold.c
+@@ -0,0 +1,949 @@
++/*
++ *
++ *  Connection Manager
++ *
++ *  Copyright (C) 2014  BMW Car IT GbmH.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License version 2 as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ *
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <errno.h>
++#include <string.h>
++#include <sys/inotify.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <pwd.h>
++#include <grp.h>
++
++#include <glib.h>
++
++#include <gdbus.h>
++#define CONNMAN_API_SUBJECT_TO_CHANGE
++#include <connman/plugin.h>
++#include <connman/log.h>
++#include <connman/session.h>
++#include <connman/dbus.h>
++#include <connman/inotify.h>
++#include <connman/notifier.h>
++
++#include <../src/connman.h>
++
++#include "src/shared/util.h"
++
++#define POLD_BUS_NAME			"de.bmw.pold1"
++#define POLD_PATH			"/de/bmw/pold1"
++#define POLD_MANAGER_INTERFACE		"de.bmw.pold.Manager1"
++#define POLD_NOTIFICATION_INTERFACE	"de.bmw.pold.Notification1"
++#define POLD_ERROR_INTERFACE		"de.bmw.pold.Error1"
++#define AGENT_PATH			"/de/bmw/pold/agent1"
++
++#define TIMEOUT 60000
++
++static DBusConnection *connection;
++static DBusPendingCall *register_call;
++static bool agent_registered;
++static char *agent_owner;
++static unsigned int watch_id;
++static unsigned int connect_timeout;
++
++static GHashTable *session_hash; /* (session owner, policy_config) */
++static GHashTable *service_hash;
++
++struct policy_config {
++	char *owner;
++
++	char *selinux, *user, *group;
++
++	/* The policy config owned by the session */
++	struct connman_session_config *config;
++
++	/* To which policy belongs this policy_config */
++	struct connman_session *session;
++
++	connman_session_config_func_t create_cb;
++
++	DBusPendingCall *pending;
++
++	struct cb_data *cbd;
++
++	bool active;
++	GSList *bearers;
++};
++
++struct service_info {
++	struct connman_service *service;
++	enum connman_service_state state;
++	unsigned int score;
++};
++
++static void cleanup_service(gpointer data)
++{
++	struct service_info *info = data;
++
++	g_free(info);
++}
++
++static void print_policy_config(struct policy_config *policy)
++{
++	struct connman_session_config *config = policy->config;
++	GSList *list;
++
++	DBG("session %p owner %s policy %p ", policy->session, policy->owner,
++		policy);
++	DBG("config %p", config);
++	DBG("\tid %s type %d", config->id, config->id_type);
++	DBG("\tpriority %d", config->priority);
++	DBG("\troaming_policy %d", config->roaming_policy);
++	DBG("\tsession type %d", config->type);
++	DBG("\tecall %d", config->ecall);
++
++	for (list = config->allowed_bearers; list; list = list->next)
++		DBG("\tbearer %d", GPOINTER_TO_UINT(list->data));
++}
++
++static DBusMessage *error_invalid_arguments(DBusMessage *msg)
++{
++	return g_dbus_create_error(msg, POLD_ERROR_INTERFACE ".Failed",
++					"Invalid parameters");
++}
++
++static DBusMessage *error_failed(DBusMessage *msg, int errnum)
++{
++	const char *str = strerror(errnum);
++
++	return g_dbus_create_error(msg, POLD_ERROR_INTERFACE ".Failed",
++				"%s", str);
++}
++
++static int parse_bearers(DBusMessageIter *iter, GSList **list)
++{
++	DBusMessageIter array;
++	int type, err;
++
++	dbus_message_iter_recurse(iter, &array);
++
++	*list = NULL;
++
++	while ((type = dbus_message_iter_get_arg_type(&array)) !=
++			DBUS_TYPE_INVALID) {
++		char *bearer_name = NULL;
++
++		if (type != DBUS_TYPE_STRING) {
++			g_slist_free(*list);
++			*list = NULL;
++			return -EINVAL;
++		}
++
++		dbus_message_iter_get_basic(&array, &bearer_name);
++
++		err = connman_session_parse_bearers(bearer_name, list);
++		if (err < 0) {
++			g_slist_free(*list);
++			*list = NULL;
++			return err;
++		}
++
++		dbus_message_iter_next(&array);
++	}
++
++	return 0;
++}
++
++static void cleanup_register_call(void)
++{
++	if (register_call) {
++		dbus_pending_call_cancel(register_call);
++		dbus_pending_call_unref(register_call);
++		register_call = NULL;
++	}
++}
++
++static int parse_policy_config(struct policy_config *policy,
++				DBusMessageIter *iter)
++{
++	DBusMessageIter array;
++	int err;
++
++	dbus_message_iter_recurse(iter, &array);
++
++	while (dbus_message_iter_get_arg_type(&array) == DBUS_TYPE_DICT_ENTRY) {
++		DBusMessageIter entry, value;
++		const char *key;
++
++		dbus_message_iter_recurse(&array, &entry);
++		dbus_message_iter_get_basic(&entry, &key);
++
++		dbus_message_iter_next(&entry);
++		dbus_message_iter_recurse(&entry, &value);
++
++		switch (dbus_message_iter_get_arg_type(&value)) {
++		case DBUS_TYPE_STRING:
++			if (g_str_equal(key, "Id")) {
++				char *str;
++				char **id;
++				int err = 0;
++
++				dbus_message_iter_get_basic(&value, &str);
++
++				id = g_strsplit(str, ":", 2);
++
++				if (g_str_equal(id[0], "selinux")) {
++					g_free(policy->selinux);
++					policy->selinux = g_strdup(id[1]);
++				} else if (g_str_equal(id[0], "user")) {
++					g_free(policy->user);
++					policy->user = g_strdup(id[1]);
++				} else if (g_str_equal(id[0], "group")) {
++					g_free(policy->group);
++					policy->group = g_strdup(id[1]);
++				} else
++					err = -EINVAL;
++
++				g_strfreev(id);
++
++				if (err)
++					return err;
++			}
++
++		case DBUS_TYPE_ARRAY:
++			if (g_str_equal(key, "AllowedBearers")) {
++				g_slist_free(policy->config->allowed_bearers);
++				policy->config->allowed_bearers = NULL;
++
++				err = parse_bearers(&value,
++						&policy->config->allowed_bearers);
++				if (err < 0)
++					return err;
++			}
++			break;
++		}
++		dbus_message_iter_next(&array);
++	}
++
++	return 0;
++}
++
++static bool check_policy_reply_signature(DBusMessage *reply)
++{
++	const char *signature = DBUS_TYPE_ARRAY_AS_STRING
++		DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING
++		DBUS_TYPE_STRING_AS_STRING
++		DBUS_TYPE_VARIANT_AS_STRING
++		DBUS_DICT_ENTRY_END_CHAR_AS_STRING;
++
++	if (dbus_message_has_signature(reply, signature))
++		return true;
++
++	connman_warn("Reply %s to %s from %s has wrong signature %s",
++			signature,
++			dbus_message_get_interface(reply),
++			dbus_message_get_sender(reply),
++			dbus_message_get_signature(reply));
++
++	return false;
++}
++
++static void get_policy_cb(DBusPendingCall *pending, void *user_data)
++{
++	struct cb_data *cbd = user_data;
++	connman_session_config_func_t cb = cbd->cb;
++	struct policy_config *policy = cbd->data;
++	DBusMessage *reply;
++	DBusMessageIter iter;
++	int err;
++
++	DBG("session %p", policy->session);
++
++	if (!dbus_pending_call_get_completed(pending))
++		return;
++
++	policy->pending = NULL;
++
++	reply = dbus_pending_call_steal_reply(pending);
++	if (!reply)
++		return;
++
++	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
++		const char *dbus_error = dbus_message_get_error_name(reply);
++
++		DBG("%s", dbus_error);
++
++		/* XXX map error strings to codes */
++		err = -EIO;
++		goto out;
++	}
++
++	if (!check_policy_reply_signature(reply))
++		return;
++
++	policy = g_hash_table_lookup(session_hash, policy->owner);
++	if (!policy)
++		return;
++
++	if (!dbus_message_iter_init(reply, &iter))
++		return;
++
++	err = parse_policy_config(policy, &iter);
++	if (err < 0)
++		goto out;
++
++	if (policy->selinux) {
++		policy->config->id = g_strdup(policy->selinux);
++		policy->config->id_type = CONNMAN_SESSION_ID_TYPE_LSM;
++	} else if (policy->user) {
++		policy->config->id = g_strdup(policy->user);
++		policy->config->id_type = CONNMAN_SESSION_ID_TYPE_UID;
++	} else if (policy->group) {
++		policy->config->id = g_strdup(policy->group);
++		policy->config->id_type = CONNMAN_SESSION_ID_TYPE_GID;
++	} else {
++		DBG("No valid id in policy found (must have a field \"Id\".");
++		(*cb)(policy->session, policy->config, cbd->user_data, -EINVAL);
++		return;
++	}
++
++	print_policy_config(policy);
++
++out:
++	(*cb)(policy->session, policy->config, cbd->user_data, err);
++	if (!err)
++		policy->create_cb = NULL;
++}
++
++static int get_policy(struct policy_config *policy, struct cb_data *cbd)
++{
++	DBusMessage *msg;
++
++	msg = dbus_message_new_method_call(POLD_BUS_NAME,
++					POLD_PATH,
++					POLD_MANAGER_INTERFACE,
++					"GetPolicyConfig");
++	if (!msg)
++		goto err;
++
++	dbus_message_append_args(msg, DBUS_TYPE_STRING, &policy->owner,
++				DBUS_TYPE_INVALID);
++
++	if (!dbus_connection_send_with_reply(connection, msg,
++						&policy->pending, TIMEOUT))
++		goto err;
++
++	if (!dbus_pending_call_set_notify(policy->pending,
++						get_policy_cb, cbd, g_free))
++		goto err;
++
++	dbus_message_unref(msg);
++
++	return 0;
++err:
++	dbus_message_unref(msg);
++
++	return -EIO;
++}
++
++static void calc_service_score(struct service_info *info)
++{
++	GHashTableIter iter;
++	gpointer key, value;
++	GSList *list;
++
++	g_hash_table_iter_init(&iter, session_hash);
++	while (g_hash_table_iter_next(&iter, &key, &value)) {
++		const char *owner = key;
++		struct policy_config *policy = value;
++
++		if (!policy->active)
++			continue;
++
++		if (g_strcmp0(owner, agent_owner) == 0)
++			continue;
++
++		for (list = policy->bearers; list; list = list->next) {
++			enum connman_service_type type = GPOINTER_TO_UINT(list->data);
++
++			if (type != connman_service_get_type(info->service))
++				continue;
++
++			if (!connman_service_get_autoconnect(info->service))
++				continue;
++
++			/*
++			 *  This service matches the configuration,
++			 * let's now weight it according it's
++			 * state.
++			 */
++
++			if (info->state == CONNMAN_SERVICE_STATE_READY ||
++					info->state == CONNMAN_SERVICE_STATE_ONLINE)
++				info->score += 20;
++
++			if (connman_service_get_favorite(info->service))
++				info->score += 6;
++
++			switch (type) {
++			case CONNMAN_SERVICE_TYPE_ETHERNET:
++				info->score += 5;
++				break;
++			case CONNMAN_SERVICE_TYPE_GADGET:
++				info->score += 4;
++				break;
++			case CONNMAN_SERVICE_TYPE_WIFI:
++				info->score += 3;
++				break;
++			case CONNMAN_SERVICE_TYPE_BLUETOOTH:
++				info->score += 2;
++				break;
++			case CONNMAN_SERVICE_TYPE_CELLULAR:
++				info->score += 1;
++				break;
++			default:
++				/* we should never end up here (TM)
++				 * since only the above types are
++				 * valid in AllowedBearers */
++				break;
++			}
++		}
++	}
++}
++
++static gint sort_services(gconstpointer a, gconstpointer b)
++{
++	const struct service_info *ai = a, *bi = b;
++
++	return bi->score - ai->score;
++}
++
++static gboolean run_session_connect(gpointer user_data)
++{
++	GHashTableIter iter;
++	gpointer key, value;
++	GList *services = NULL, *list;
++	bool connect = false;
++
++	DBG("");
++
++	connect_timeout = 0;
++
++	g_hash_table_iter_init(&iter, service_hash);
++	while (g_hash_table_iter_next(&iter, &key, &value)) {
++		struct service_info *info = value;
++
++		info->score = 0;
++		calc_service_score(info);
++
++		services = g_list_prepend(services, info);
++	}
++
++	services = g_list_sort(services, sort_services);
++
++	for (list = services; list; list = list->next) {
++		struct service_info *info = list->data;
++		DBG("service %p name %s score %d state %d",
++			info->service, __connman_service_get_name(info->service),
++			info->score, info->state);
++
++		if (!connect && info->score) {
++			switch (info->state) {
++			case CONNMAN_SERVICE_STATE_UNKNOWN:
++			case CONNMAN_SERVICE_STATE_IDLE:
++				connman_session_connect(info->service);
++				connect = true;
++				break;
++			case CONNMAN_SERVICE_STATE_ASSOCIATION:
++			case CONNMAN_SERVICE_STATE_CONFIGURATION:
++				/* just wait */
++			case CONNMAN_SERVICE_STATE_READY:
++			case CONNMAN_SERVICE_STATE_ONLINE:
++				/* nothing to do */
++				connect = true;
++				break;
++			case CONNMAN_SERVICE_STATE_DISCONNECT:
++			case CONNMAN_SERVICE_STATE_FAILURE:
++				break;
++			}
++		} else {
++			if (info->state >= CONNMAN_SERVICE_STATE_READY)
++				connman_session_disconnect(info->service);
++		}
++	}
++
++	g_list_free(services);
++
++	return FALSE;
++}
++
++static bool policy_pold_autoconnect(enum connman_service_connect_reason reason)
++{
++	if (reason == CONNMAN_SERVICE_CONNECT_REASON_SESSION &&
++			connect_timeout == 0)
++		connect_timeout = g_timeout_add_seconds(0, run_session_connect,
++							NULL);
++
++	return false;
++}
++
++static int policy_pold_create(struct connman_session *session,
++				connman_session_config_func_t cb,
++				void *user_data)
++{
++	struct cb_data *cbd;
++	struct policy_config *policy;
++	int err;
++
++	policy = g_new0(struct policy_config, 1);
++	policy->config = connman_session_create_default_config();
++	policy->session = session;
++	policy->owner = g_strdup(connman_session_get_owner(session));
++
++	DBG("session %p policy %p owner %s", session, policy, policy->owner);
++
++	g_hash_table_replace(session_hash, policy->owner, policy);
++
++	cbd = cb_data_new(cb, user_data);
++	cbd->data = policy;
++
++	if (!agent_registered) {
++		policy->create_cb = cb;
++		policy->cbd = cbd;
++		return -EINPROGRESS;
++	}
++
++	err = get_policy(policy, cbd);
++	if (err < 0)
++		goto err;
++
++	return -EINPROGRESS;
++
++err:
++	g_free(policy->owner);
++	g_free(policy->config);
++	g_free(cbd);
++	return -EIO;
++}
++
++static void policy_pold_destroy(struct connman_session *session)
++{
++	struct policy_config *policy;
++	const char *owner;
++
++	DBG("session %p", session);
++
++	owner = connman_session_get_owner(session);
++	policy = g_hash_table_lookup(session_hash, owner);
++	if (!policy)
++		return;
++
++	g_hash_table_remove(session_hash, owner);
++}
++
++static void policy_pold_session_changed(struct connman_session *session,
++					bool active, GSList *bearers)
++{
++	struct policy_config *policy;
++	const char *owner;
++
++	owner = connman_session_get_owner(session);
++	policy = g_hash_table_lookup(session_hash, owner);
++	if (!policy)
++		return;
++
++	DBG("policy %p session %p active %d", policy, session, active);
++
++	policy->active = active;
++	if (active)
++		policy->bearers = bearers;
++	else
++		policy->bearers = NULL;
++
++	policy_pold_autoconnect(CONNMAN_SERVICE_CONNECT_REASON_SESSION);
++}
++
++static bool policy_pold_allowed(struct connman_session *session,
++				struct connman_service *service)
++{
++	enum connman_service_type bearer_type;
++	enum connman_service_type service_type;
++	struct policy_config *policy;
++	GSList *list;
++	const char *owner;
++
++
++	owner = connman_session_get_owner(session);
++	policy = g_hash_table_lookup(session_hash, owner);
++	if (!policy)
++		return false;
++
++	service_type = connman_service_get_type(service);
++
++	for (list = policy->bearers; list; list = list->next) {
++		bearer_type = GPOINTER_TO_INT(list->data);
++
++		if (bearer_type == service_type)
++			return true;
++	}
++
++	return false;
++}
++
++static struct connman_session_policy session_policy_pold = {
++	.name = "session pold policy configuration",
++	.priority = CONNMAN_SESSION_POLICY_PRIORITY_DEFAULT + 1,
++	.autoconnect = policy_pold_autoconnect,
++	.create = policy_pold_create,
++	.destroy = policy_pold_destroy,
++	.session_changed = policy_pold_session_changed,
++	.allowed = policy_pold_allowed,
++};
++
++static void cleanup_config(gpointer user_data)
++{
++	struct policy_config *policy = user_data;
++
++	DBG("session %p policy %p onwer %s", policy->session, policy, policy->owner);
++
++	if (policy->pending) {
++		dbus_pending_call_cancel(policy->pending);
++		dbus_pending_call_unref(policy->pending);
++	}
++
++	g_free(policy->selinux);
++	g_free(policy->user);
++	g_free(policy->group);
++	g_free(policy->owner);
++	g_free(policy);
++}
++
++static DBusMessage *agent_release(DBusConnection *conn,
++					DBusMessage *msg, void *user_data)
++{
++	DBG("");
++
++	agent_registered = false;
++	g_free(agent_owner);
++	agent_owner = NULL;
++
++	g_dbus_unregister_interface(connection,
++				AGENT_PATH, POLD_NOTIFICATION_INTERFACE);
++
++	return g_dbus_create_reply(msg, DBUS_TYPE_INVALID);
++}
++
++static bool check_agent_update_signature(DBusMessage *msg)
++{
++	const char *signature = DBUS_TYPE_STRING_AS_STRING
++		DBUS_TYPE_ARRAY_AS_STRING
++		DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING
++		DBUS_TYPE_STRING_AS_STRING
++		DBUS_TYPE_VARIANT_AS_STRING
++		DBUS_DICT_ENTRY_END_CHAR_AS_STRING;
++
++	if (dbus_message_has_signature(msg, signature))
++		return true;
++
++	connman_warn("Reply %s to %s from %s has wrong signature %s",
++			signature,
++			dbus_message_get_interface(msg),
++			dbus_message_get_sender(msg),
++			dbus_message_get_signature(msg));
++
++	return false;
++}
++
++static DBusMessage *agent_update(DBusConnection *conn,
++					DBusMessage *msg, void *user_data)
++{
++	DBusMessageIter iter;
++	struct policy_config *policy;
++	const char *owner;
++	int err;
++
++	DBG("");
++
++	if (!check_agent_update_signature(msg))
++		return error_invalid_arguments(msg);
++
++	if (!dbus_message_iter_init(msg, &iter))
++		return error_invalid_arguments(msg);
++
++	if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_STRING)
++		return error_invalid_arguments(msg);
++
++	dbus_message_iter_get_basic(&iter, &owner);
++	policy = g_hash_table_lookup(session_hash, owner);
++	if (!policy)
++		goto out;
++
++	dbus_message_iter_next(&iter);
++	err = parse_policy_config(policy, &iter);
++	if (err < 0)
++		return error_failed(msg, -err);
++
++	print_policy_config(policy);
++
++	connman_session_config_update(policy->session);
++
++out:
++	return g_dbus_create_reply(msg, DBUS_TYPE_INVALID);
++}
++
++static const GDBusMethodTable agent_methods[] = {
++	{ GDBUS_METHOD("Release", NULL, NULL, agent_release) },
++	{ GDBUS_METHOD("Update",
++			GDBUS_ARGS({ "owner", "s" }, { "value", "a{sv}" }),
++			NULL, agent_update) },
++	{ },
++};
++
++static void agent_register_cb(DBusPendingCall *pending, void *user_data)
++{
++	GHashTableIter iter;
++	gpointer key, value;
++	DBusMessage *reply;
++
++	if (!dbus_pending_call_get_completed(pending))
++		return;
++
++	register_call = NULL;
++
++	reply = dbus_pending_call_steal_reply(pending);
++	if (!reply)
++		goto out;
++
++	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
++		g_dbus_unregister_interface(connection,
++			        AGENT_PATH, POLD_NOTIFICATION_INTERFACE);
++		goto out;
++	}
++
++	agent_registered = true;
++	agent_owner = g_strdup(dbus_message_get_sender(reply));
++
++	g_hash_table_iter_init(&iter, session_hash);
++	while (g_hash_table_iter_next(&iter, &key, &value)) {
++		struct policy_config *policy = value;
++
++		if (!policy->cbd)
++			continue;
++
++		if (get_policy(policy, policy->cbd) < 0)
++			g_free(policy->cbd);
++		policy->cbd = NULL;
++	}
++
++	dbus_message_unref(reply);
++out:
++	dbus_pending_call_unref(pending);
++}
++
++static void agent_register(void)
++{
++	const char *path = AGENT_PATH;
++	DBusMessage *msg;
++
++	DBG("");
++
++	msg = dbus_message_new_method_call(POLD_BUS_NAME, POLD_PATH,
++				POLD_MANAGER_INTERFACE, "RegisterAgent");
++	if (!msg)
++		return;
++
++	dbus_message_append_args(msg, DBUS_TYPE_OBJECT_PATH,
++				&path, DBUS_TYPE_INVALID);
++
++	if (!dbus_connection_send_with_reply(connection, msg,
++					&register_call, TIMEOUT))
++		goto out;
++
++	if (!dbus_pending_call_set_notify(register_call,
++					agent_register_cb, NULL, NULL))
++		cleanup_register_call();
++
++out:
++	dbus_message_unref(msg);
++}
++
++static void agent_unregister(void)
++{
++	const char *path = AGENT_PATH;
++	DBusMessage *msg;
++
++	DBG("");
++
++	if (!agent_registered)
++		return cleanup_register_call();
++
++	agent_registered = false;
++
++	msg = dbus_message_new_method_call(POLD_BUS_NAME, POLD_PATH,
++					POLD_MANAGER_INTERFACE,
++					"UnregisterAgent");
++	if (msg) {
++		dbus_message_append_args(msg, DBUS_TYPE_OBJECT_PATH,
++					&path, DBUS_TYPE_INVALID);
++		g_dbus_send_message(connection, msg);
++	}
++
++	g_dbus_unregister_interface(connection,
++				AGENT_PATH, POLD_NOTIFICATION_INTERFACE);
++
++
++	/* XXX update all session */
++}
++
++static void pold_appeared(DBusConnection *conn, void *user_data)
++{
++	DBG("");
++
++	if (agent_registered)
++		return;
++
++	if (!g_dbus_register_interface(connection, AGENT_PATH,
++				        POLD_NOTIFICATION_INTERFACE,
++					agent_methods, NULL, NULL,
++					NULL, NULL))
++		return;
++
++	agent_register();
++}
++
++static void pold_disappeared(DBusConnection *conn, void *user_data)
++{
++	DBG("");
++
++	if (agent_registered) {
++		g_dbus_unregister_interface(connection,
++				AGENT_PATH, POLD_NOTIFICATION_INTERFACE);
++		agent_registered = false;
++	}
++
++	cleanup_register_call();
++}
++
++static void service_add(struct connman_service *service, const char *name)
++{
++	struct service_info *info;
++
++	DBG("service %p name %s", service, name);
++
++	info = g_new0(struct service_info, 1);
++	info->service = service;
++	info->state = CONNMAN_SERVICE_STATE_UNKNOWN;
++
++	g_hash_table_replace(service_hash, service, info);
++}
++
++static void service_remove(struct connman_service *service)
++{
++	DBG("service %p", service);
++
++	g_hash_table_remove(service_hash, service);
++}
++
++static void service_state_changed(struct connman_service *service,
++					enum connman_service_state state)
++{
++	struct service_info *info;
++
++	DBG("service %p state %d", service, state);
++
++	info = g_hash_table_lookup(service_hash, service);
++	if (!info)
++		return;
++
++	info->state = state;
++}
++
++static struct connman_notifier pold_notifier = {
++	.name			= "pold",
++	.service_add		= service_add,
++	.service_remove		= service_remove,
++	.service_state_changed	= service_state_changed,
++};
++
++static int session_policy_pold_init(void)
++{
++	int err;
++
++	DBG("");
++
++	connection = connman_dbus_get_connection();
++	if (!connection)
++		return -EIO;
++
++	session_hash = g_hash_table_new_full(g_str_hash, g_str_equal,
++						NULL, cleanup_config);
++
++	service_hash = g_hash_table_new_full(g_direct_hash, g_direct_equal,
++						NULL, cleanup_service);
++
++	err = connman_session_policy_register(&session_policy_pold);
++	if (err < 0)
++		goto err;
++
++	watch_id = g_dbus_add_service_watch(connection,	POLD_BUS_NAME,
++			pold_appeared, pold_disappeared, NULL, NULL);
++	if (watch_id == 0) {
++		err = -ENOMEM;
++		goto err;
++	}
++
++	err = connman_notifier_register(&pold_notifier);
++	if (err < 0)
++		goto err;
++
++	return 0;
++
++err:
++	if (session_hash)
++		g_hash_table_destroy(session_hash);
++
++	dbus_connection_unref(connection);
++
++	return err;
++}
++
++static void session_policy_pold_exit(void)
++{
++	DBG("");
++
++	agent_unregister();
++
++	if (connect_timeout) {
++		g_source_remove(connect_timeout);
++		connect_timeout = 0;
++	}
++
++	if (watch_id != 0)
++		g_dbus_remove_watch(connection, watch_id);
++
++	g_hash_table_destroy(service_hash);
++
++	g_hash_table_destroy(session_hash);
++
++	connman_notifier_unregister(&pold_notifier);
++
++	connman_session_policy_unregister(&session_policy_pold);
++
++	dbus_connection_unref(connection);
++}
++
++CONNMAN_PLUGIN_DEFINE(session_policy_pold,
++		"Session pold file policy configuration plugin",
++		VERSION, CONNMAN_PLUGIN_PRIORITY_DEFAULT,
++		session_policy_pold_init, session_policy_pold_exit)
+-- 
+1.8.5.3
+

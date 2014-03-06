@@ -1,0 +1,32 @@
+From 17c69f3b17dd2e05e0ea080788c54c634cb8dc84 Mon Sep 17 00:00:00 2001
+From: Daniel Wagner <daniel.wagner@bmw-carit.de>
+Date: Wed, 5 Mar 2014 10:42:00 +0100
+Subject: [PATCH 1/7] session: On session connect check service is already
+ availabe
+
+When the session_connect() is called, the auto connect algorithm might
+decide there is nothing to do because there is already a service
+online. In this case the session stays offline until there is a change
+via service_state_changed(). Therefore we need to go through the list
+of online services and see if there is already a online service which
+matches the current session configuration and select that one.
+---
+ src/session.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/session.c b/src/session.c
+index 51f29ab..8f9db49 100644
+--- a/src/session.c
++++ b/src/session.c
+@@ -945,6 +945,8 @@ static DBusMessage *connect_session(DBusConnection *conn,
+ 				session->info->config.allowed_bearers);
+ 	}
+ 
++	session_activate(session);
++
+ 	__connman_service_auto_connect(CONNMAN_SERVICE_CONNECT_REASON_SESSION);
+ 
+ 	return g_dbus_create_reply(msg, DBUS_TYPE_INVALID);
+-- 
+1.8.5.3
+

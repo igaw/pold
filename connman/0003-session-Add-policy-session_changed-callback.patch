@@ -1,0 +1,51 @@
+From 6f031526386dbb2cd1e8af00cd498fd978ab32bf Mon Sep 17 00:00:00 2001
+From: Daniel Wagner <daniel.wagner@bmw-carit.de>
+Date: Thu, 27 Feb 2014 13:38:22 +0100
+Subject: [PATCH 3/7] session: Add policy session_changed callback
+
+---
+ include/session.h | 3 ++-
+ src/session.c     | 6 +++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/include/session.h b/include/session.h
+index 2001e0c..224a98b 100644
+--- a/include/session.h
++++ b/include/session.h
+@@ -79,7 +79,8 @@ struct connman_session_policy {
+ 			connman_session_config_func_t cb,
+ 			void *user_data);
+ 	void (*destroy)(struct connman_session *session);
+-
++	void (*session_changed)(struct connman_session *session, bool active,
++				GSList *bearers);
+ };
+ 
+ int connman_session_policy_register(struct connman_session_policy *config);
+diff --git a/src/session.c b/src/session.c
+index 7a786a8..d596753 100644
+--- a/src/session.c
++++ b/src/session.c
+@@ -418,6 +418,11 @@ static void free_session(struct connman_session *session)
+ 
+ static void set_active_session(struct connman_session *session, bool enable)
+ {
++
++	if (policy && policy->session_changed)
++		policy->session_changed(session, enable,
++					session->info->config.allowed_bearers);
++
+ 	__connman_service_set_active_session(enable,
+ 				session->info->config.allowed_bearers);
+ }
+@@ -1511,7 +1516,6 @@ static void session_activate(struct connman_session *session)
+ 
+ 	if (!service_hash)
+ 		return;
+-
+ 	g_hash_table_iter_init(&iter, service_hash);
+ 	while (g_hash_table_iter_next(&iter, &key, &value)) {
+ 		struct connman_service_info *info = value;
+-- 
+1.8.5.3
+

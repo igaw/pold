@@ -1,0 +1,40 @@
+From d50a32436d515f5fbbce916b4068730689022b2c Mon Sep 17 00:00:00 2001
+From: Daniel Wagner <daniel.wagner@bmw-carit.de>
+Date: Thu, 27 Feb 2014 13:43:18 +0100
+Subject: [PATCH 4/7] session: Add policy plugin allowed callback
+
+---
+ include/session.h | 2 ++
+ src/session.c     | 3 +++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/include/session.h b/include/session.h
+index 224a98b..9832f25 100644
+--- a/include/session.h
++++ b/include/session.h
+@@ -81,6 +81,8 @@ struct connman_session_policy {
+ 	void (*destroy)(struct connman_session *session);
+ 	void (*session_changed)(struct connman_session *session, bool active,
+ 				GSList *bearers);
++	bool (*allowed)(struct connman_session *session,
++			struct connman_service *service);
+ };
+ 
+ int connman_session_policy_register(struct connman_session_policy *config);
+diff --git a/src/session.c b/src/session.c
+index d596753..70fdfeb 100644
+--- a/src/session.c
++++ b/src/session.c
+@@ -1476,6 +1476,9 @@ static bool session_match_service(struct connman_session *session,
+ 	enum connman_service_type service_type;
+ 	GSList *list;
+ 
++	if (policy && policy->allowed)
++		return policy->allowed(session, service);
++
+ 	for (list = session->info->config.allowed_bearers; list; list = list->next) {
+ 		bearer_type = GPOINTER_TO_INT(list->data);
+ 		service_type = connman_service_get_type(service);
+-- 
+1.8.5.3
+
