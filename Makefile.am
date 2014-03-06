@@ -67,3 +67,70 @@ src_pold_LDADD = \
 	$(JANSSON_LIBS)
 
 src_pold_SHORTNAME = pold
+
+#
+# Tests
+#
+
+check_PROGRAMS = \
+	test/policy-test \
+	test/dbus-json-test \
+	test/http-client-test
+
+test_policy_test_SOURCES = \
+	src/log.h \
+	src/log.c \
+	test/policy-test.c \
+	test/gdbus.h \
+	test/gdbus.c
+
+test_policy_test_CFLAGS = \
+	$(AM_CFLAGS) \
+	$(WARNINGFLAGS) \
+	$(DBUS_CFLAGS) \
+	$(GLIB_CFLAGS) \
+	$(JANSSON_CFLAGS)
+
+test_policy_test_LDADD = \
+	$(GCLDFLAGS) \
+	$(GLIB_LIBS) \
+	$(DBUS_LIBS) \
+	$(LOG_LIBS) \
+	$(JANSSON_LIBS)
+
+test_dbus_json_test_SOURCES = \
+	src/dbus-json.h \
+	src/dbus-json.c \
+	test/dbus-json-test.c
+
+test_dbus_json_test_CFLAGS = \
+	$(AM_CFLAGS) \
+	$(WARNINGFLAGS) \
+	$(DBUS_CFLAGS) \
+	$(GLIB_CFLAGS) \
+	$(JANSSON_CFLAGS)
+
+test_dbus_json_test_LDADD = \
+	$(GCLDFLAGS) \
+	$(GLIB_LIBS) \
+	$(DBUS_LIBS) \
+	$(JANSSON_LIBS)
+
+test_http_client_test_SOURCES = \
+	test/http-client-test.c
+
+test_http_client_test_CFLAGS = \
+	$(AM_CFLAGS) \
+	$(WARNINGFLAGS) \
+	$(GLIB_CFLAGS) \
+	$(DBUS_CFLAGS) \
+	$(LIBSOUP_CFLAGS)
+
+test_http_client_test_LDADD = \
+	$(GCLDFLAGS) \
+	$(GLIB_LIBS) \
+	$(DBUS_LIBS) \
+	$(LOG_LIBS) \
+	$(LIBSOUP_LIBS)
+
+TESTS = $(check_PROGRAMS)
