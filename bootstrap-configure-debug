@@ -1,0 +1,4 @@
+#!/bin/sh
+
+. ./bootstrap && \
+	exec ./configure --localstatedir=/var CFLAGS="-g -O0 -Werror" --enable-debug
