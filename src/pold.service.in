@@ -1,0 +1,7 @@
+[Unit]
+Description=GENIVI Policy Daemon
+
+[Service]
+Type=dbus
+BusName=de.bmw.net.pold
+ExecStart=@prefix@/bin/pold

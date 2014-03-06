@@ -1,0 +1,4 @@
+{
+  "Id" : "user:@POLD_SYSTEM_USER@",
+  "AllowedBearers" : "*"
+}

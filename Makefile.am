@@ -72,6 +72,23 @@ EXTRA_DIST = \
 	policyserver/policyserver.py \
 	policyserver/someuser.policies
 
+# This a big hack, if you know how to do better, please send patches
+install-exec-hook:
+	-chown @POLD_SYSTEM_USER@ $(DESTDIR)$(sbindir)/pold
+	$(AM_V_at)$(MKDIR_P) $(DESTDIR)$(localstatedir)/lib/pold/policies
+	-chown @POLD_SYSTEM_USER@ $(DESTDIR)$(localstatedir)/lib/pold
+	-chown @POLD_SYSTEM_USER@ $(DESTDIR)$(localstatedir)/lib/pold/policies
+	$(INSTALL_DATA) -o @POLD_SYSTEM_USER@ src/default.policy \
+			$(DESTDIR)$(localstatedir)/lib/pold/default.policy
+	$(INSTALL_DATA) -o @POLD_SYSTEM_USER@ src/pold.policy \
+			$(DESTDIR)$(localstatedir)/lib/pold/pold.policy
+	$(INSTALL_DATA) -D src/pold.conf \
+			$(DESTDIR)$(sysconfdir)/dbus-1/system.d/pold.conf
+
+uninstall-hook:
+	rm -rf $(DESTDIR)$(localstatedir)/lib/pold
+	rm $(DESTDIR)$(sysconfdir)/dbus-1/system.d/pold.conf
+
 #
 # Tests
 #
