@@ -68,6 +68,10 @@ src_pold_LDADD = \
 
 src_pold_SHORTNAME = pold
 
+EXTRA_DIST = \
+	policyserver/policyserver.py \
+	policyserver/someuser.policies
+
 #
 # Tests
 #
