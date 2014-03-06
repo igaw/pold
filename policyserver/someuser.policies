@@ -1,0 +1,9 @@
+[
+{
+	"Id": "user:someuser",
+	"RoamingPolicy": "forbidden",
+	"ConnectionType": "internet",
+	"AllowedBearers": ["ethernet", "wifi", "cellular", "bluetooth"]
+}
+]
+
