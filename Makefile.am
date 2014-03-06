@@ -20,7 +20,28 @@ gdbus_sources = \
 	gdbus/polkit.c
 
 pold_sources = \
-	src/main.c
+	src/log.h \
+	src/log.c \
+	src/main.c \
+	src/fdo-dbus.h \
+	src/fdo-dbus.c \
+	src/dbus-common.c \
+	src/dbus-common.h \
+	src/policy.h \
+	src/policy.c \
+	src/connman-notification.h \
+	src/connman-notification.c \
+	src/connman-manager.h \
+	src/connman-manager.c \
+	src/pold-manager.h \
+	src/pold-manager.c \
+	src/session.h \
+	src/session.c \
+	src/http-client.h \
+	src/http-client.c \
+	src/dbus-json.h \
+	src/dbus-json.c \
+	src/dbus.h
 
 sbin_PROGRAMS = src/pold
 src_pold_SOURCES = \
