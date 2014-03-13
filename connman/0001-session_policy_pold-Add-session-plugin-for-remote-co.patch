@@ -1,7 +1,7 @@
-From 83ab1b258843405997bd6e2bafb4f7284193d8d4 Mon Sep 17 00:00:00 2001
+From 3da37ce5c57d942807be9f6c29e18e599ccbc396 Mon Sep 17 00:00:00 2001
 From: Daniel Wagner <daniel.wagner@bmw-carit.de>
 Date: Thu, 6 Mar 2014 17:25:53 +0100
-Subject: [PATCH 7/7] session_policy_pold: Add session plugin for remote
+Subject: [PATCH] session_policy_pold: Add session plugin for remote
  configuration
 
 The configuration/provisioning will be retrieved from pold, that is
@@ -38,7 +38,7 @@ index cf0f9a8..f517ba0 100644
  builtin_modules += neard
  builtin_sources += plugins/neard.c
 diff --git a/configure.ac b/configure.ac
-index ceb956c..5090d5c 100644
+index 230b49e..ebc4f3c 100644
 --- a/configure.ac
 +++ b/configure.ac
 @@ -194,6 +194,12 @@ AC_ARG_ENABLE(session-policy-local,
